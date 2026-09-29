@@ -19,9 +19,6 @@ jobs:
           - runner: ubuntu-latest
             os: linux
             arch: x86_64
-          - runner: macos-13
-            os: macos
-            arch: x86_64
           - runner: macos-14
             os: macos
             arch: aarch64

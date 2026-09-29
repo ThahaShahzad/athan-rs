@@ -1,6 +1,6 @@
-//! Ratatui-based TUI kiosk: full-screen block-digit clock, prominent
-//! next-prayer countdown, six bordered prayer cards, night-thirds (Qiyam)
-//! cards, and a slim footer with location/method + key bindings.
+//! Ratatui-based TUI kiosk: a giant block-digit clock filling the left
+//! column, a prominent next-prayer countdown, six bordered prayer cards, a
+//! night-thirds (Qiyam) card, and a slim footer with location/method + keys.
 //!
 //! Port of `tui.js` from the Node athan-cli, upgraded to a kiosk layout.
 //!
@@ -114,12 +114,14 @@ pub fn run_tui(_config: &Config) -> Result<(), AppError> {
 }
 
 // ---------------------------------------------------------------------------
-// Big block-digit glyphs (5 wide, 7 tall).
+// Scaled block-digit glyphs: a 5x7 pixel font stretched to fill its area.
+// Each glyph pixel becomes one cell wide and one half-block tall, so pixels
+// stay square and the digits grow as large as the box allows.
 // ---------------------------------------------------------------------------
 
 const DIGITS: [[&str; 7]; 10] = [
     [" ███ ", "█   █", "█   █", "█   █", "█   █", "█   █", " ███ "],
-    ["   █ ", "  ██ ", "   █ ", "   █ ", "   █ ", "   █ ", " ███ "],
+    ["   █ ", "  ██ ", "   █ ", "   █ ", "   █ ", "   █ ", "   █ "],
     [" ███ ", "█   █", "    █", "  ██ ", " █   ", "█    ", "█████"],
     [" ███ ", "█   █", "    █", "  ██ ", "    █", "█   █", " ███ "],
     ["   ██", "  █ █", " █  █", "█   █", "█████", "    █", "    █"],
@@ -130,68 +132,138 @@ const DIGITS: [[&str; 7]; 10] = [
     [" ███ ", "█   █", "█   █", " ████", "    █", "█   █", " ███ "],
 ];
 
-const COLON: [&str; 7] = ["   ", " █ ", " █ ", "   ", " █ ", " █ ", "   "];
+const GLYPH_HEIGHT: u16 = 7;
 
-const BLANK: [&str; 7] = ["   "; 7];
-
-fn glyph_rows(ch: char, colon_on: bool) -> [&'static str; 7] {
+fn glyph_width(ch: char) -> u16 {
     match ch {
-        '0'..='9' => DIGITS[ch.to_digit(10).unwrap_or(0) as usize],
-        ':' if colon_on => COLON,
-        _ => BLANK,
+        '0'..='9' => 5,
+        _ => 3,
     }
 }
 
-fn digit_style() -> Style {
-    Style::default()
+/// Pixel (col, row) of the 7-row glyph grid for `ch`; colon pixels blink.
+fn glyph_pixel(ch: char, colon_on: bool, col: u16, row: usize) -> bool {
+    match ch {
+        '0'..='9' => {
+            let glyph = DIGITS[ch.to_digit(10).unwrap_or(0) as usize];
+            glyph[row].chars().nth(col as usize) == Some('█')
+        }
+        ':' => colon_on && col == 1 && matches!(row, 1 | 2 | 4 | 5),
+        _ => false,
+    }
 }
 
-fn draw_clock(frame: &mut Frame, area: Rect, local_now: chrono::DateTime<Local>) {
-    // Big block-digit clock fits when the top area is at least 7 tall and the
-    // glyphs + AM/PM tag fit (5-glyph digits separated by spaces).
-    let big = area.height >= 7 && area.width >= 48;
-
-    if !big {
-        let clock = Paragraph::new(Line::from(Span::styled(
-            local_now.format("%-I:%M:%S %p").to_string(),
-            digit_style(),
-        )))
-        .alignment(Alignment::Center);
-        frame.render_widget(clock, area);
-        return;
+/// Render `text` as block digits scaled up to fill `area`; each glyph pixel
+/// is drawn as an `s`x`s` block of half-row pixels so it stays square.
+/// Returns false when the text cannot fit and the caller should fall back
+/// to a plain text paragraph.
+fn render_big_digits(
+    frame: &mut Frame,
+    area: Rect,
+    text: &str,
+    colon_on: bool,
+    style: Style,
+) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    if area.width == 0 || area.height == 0 || chars.is_empty() {
+        return false;
     }
 
-    let time = local_now.format("%-I:%M:%S").to_string();
-    let period = local_now.format("%p").to_string();
-    let colon_on = local_now.timestamp() % 2 == 0;
-    let digit_style = Style::default();
-
-    // One 7-row composition: digits separated by single spaces, then a gap
-    // with the AM/PM tag on the middle row. Each row is rendered into its own
-    // 1-row rect so they stack instead of overwriting each other.
-    let mut rows: Vec<Vec<Span>> = vec![Vec::new(); 7];
-    for (i, ch) in time.chars().enumerate() {
+    // Grid column where each character starts, plus the total grid width.
+    let mut starts: Vec<u16> = Vec::with_capacity(chars.len());
+    let mut grid_w: u16 = 0;
+    for (i, &ch) in chars.iter().enumerate() {
         if i > 0 {
-            for row in &mut rows {
-                row.push(Span::raw(" "));
+            grid_w += 1; // 1-column gap between glyphs
+        }
+        starts.push(grid_w);
+        grid_w += glyph_width(ch);
+    }
+
+    // One cell column is one pixel wide; one cell row is two pixel rows
+    // (half-blocks), so the pixel canvas is width x 2*height.
+    let canvas_h = u32::from(area.height) * 2;
+    if u32::from(grid_w) > u32::from(area.width) || u32::from(GLYPH_HEIGHT) > canvas_h {
+        return false;
+    }
+    let scale =
+        (u32::from(area.width) / u32::from(grid_w)).min(canvas_h / u32::from(GLYPH_HEIGHT));
+    let scaled_w = u32::from(grid_w) * scale;
+    let scaled_h = u32::from(GLYPH_HEIGHT) * scale;
+    let off_x = (u32::from(area.width) - scaled_w) / 2;
+    // Keep the vertical offset even so cell rows align with pixel pairs.
+    let off_y = ((canvas_h - scaled_h) / 2) & !1;
+
+    let pixel_on = |px: u32, py: u32| -> bool {
+        if px < off_x || py < off_y {
+            return false;
+        }
+        let gx = ((px - off_x) / scale) as u16;
+        let gy = ((py - off_y) / scale) as usize;
+        if gx >= grid_w || gy >= GLYPH_HEIGHT as usize {
+            return false;
+        }
+        let mut idx = 0;
+        let mut rel = 0;
+        for i in (0..chars.len()).rev() {
+            if gx >= starts[i] {
+                idx = i;
+                rel = gx - starts[i];
+                break;
             }
         }
-        let glyph = glyph_rows(ch, colon_on);
-        for (r, seg) in glyph.iter().enumerate() {
-            rows[r].push(Span::styled((*seg).to_string(), digit_style));
-        }
-    }
-    for (r, row) in rows.iter_mut().enumerate() {
-        row.push(Span::raw("   "));
-        row.push(Span::styled(
-            if r == 3 { period.clone() } else { "     " .to_string() },
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
-    }
-    for (r, row) in rows.into_iter().enumerate() {
+        glyph_pixel(chars[idx], colon_on, rel, gy)
+    };
+
+    for r in 0..area.height {
+        let py_top = u32::from(r) * 2;
+        let row: String = (0..u32::from(area.width))
+            .map(|px| {
+                let (top, bottom) = (pixel_on(px, py_top), pixel_on(px, py_top + 1));
+                half_char(top, bottom)
+            })
+            .collect();
         frame.render_widget(
-            Paragraph::new(Line::from(row)).alignment(Alignment::Center),
-            Rect::new(area.x, area.y + r as u16, area.width, 1),
+            Paragraph::new(Line::from(Span::styled(row, style))),
+            Rect::new(area.x, area.y.saturating_add(r), area.width, 1),
+        );
+    }
+    true
+}
+
+fn draw_clock(frame: &mut Frame, area: Rect, local_now: chrono::DateTime<Local>, colon_on: bool) {
+    // Giant hours:minutes stretched to fill the whole clock area.
+    let time = local_now.format("%-I:%M").to_string();
+    if render_big_digits(frame, area, &time, colon_on, Style::default()) {
+        return;
+    }
+    let clock = Paragraph::new(Line::from(Span::styled(
+        local_now.format("%-I:%M:%S %p").to_string(),
+        Style::default(),
+    )))
+    .alignment(Alignment::Center);
+    frame.render_widget(clock, area);
+}
+
+/// Seconds in block digits with the AM/PM tag beside them.
+fn draw_seconds(frame: &mut Frame, area: Rect, local_now: chrono::DateTime<Local>) {
+    let seconds = local_now.format("%S").to_string();
+    if !render_big_digits(frame, area, &seconds, true, Style::default()) {
+        frame.render_widget(
+            Paragraph::new(local_now.format("%S %p").to_string()).alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+    if area.width >= 24 {
+        let period = Paragraph::new(Line::from(Span::styled(
+            local_now.format("%p").to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Right);
+        frame.render_widget(
+            period,
+            Rect::new(area.x, area.y.saturating_add(area.height / 2), area.width, 1),
         );
     }
 }
@@ -217,30 +289,7 @@ fn draw_date(frame: &mut Frame, area: Rect, local_now: chrono::DateTime<Local>) 
     frame.render_widget(hijri, area);
 }
 
-/// 3-row compact block font (each glyph 3 wide, two vertical pixel halves
-/// per character row). Bits per row: bit2=left, bit1=mid, bit0=right.
-const SMALL_DIGITS: [[u8; 6]; 10] = [
-    [0b111, 0b101, 0b101, 0b101, 0b101, 0b111],
-    [0b010, 0b110, 0b010, 0b010, 0b010, 0b111],
-    [0b111, 0b001, 0b111, 0b100, 0b111, 0b111],
-    [0b111, 0b001, 0b111, 0b001, 0b001, 0b111],
-    [0b101, 0b101, 0b111, 0b001, 0b001, 0b001],
-    [0b111, 0b100, 0b111, 0b001, 0b001, 0b111],
-    [0b111, 0b100, 0b111, 0b101, 0b101, 0b111],
-    [0b111, 0b001, 0b001, 0b001, 0b001, 0b001],
-    [0b111, 0b101, 0b111, 0b101, 0b101, 0b111],
-    [0b111, 0b101, 0b111, 0b001, 0b001, 0b111],
-];
-const SMALL_COLON: [u8; 6] = [0, 0b010, 0, 0b010, 0, 0];
-
-fn small_glyph(ch: char) -> [u8; 6] {
-    match ch {
-        '0'..='9' => SMALL_DIGITS[ch.to_digit(10).unwrap_or(0) as usize],
-        ':' => SMALL_COLON,
-        _ => [0; 6],
-    }
-}
-
+/// Half-block character for a pixel pair (top, bottom) within one cell.
 fn half_char(top: bool, bottom: bool) -> char {
     match (top, bottom) {
         (true, true) => '█',
@@ -250,43 +299,14 @@ fn half_char(top: bool, bottom: bool) -> char {
     }
 }
 
-/// Render ASCII digits/colons as 3-row half-block digits, centered in `area`.
-/// Returns false when they don't fit and the caller should fall back to text.
-fn render_small_digits(frame: &mut Frame, area: Rect, text: &str, style: Style) -> bool {
-    if area.height < 3 || text.is_empty() {
-        return false;
-    }
-    let needed = (text.chars().count() * 4).saturating_sub(1);
-    if area.width < u16::try_from(needed).unwrap_or(u16::MAX) {
-        return false;
-    }
-    let mut rows: Vec<Vec<Span>> = vec![Vec::new(); 3];
-    for (i, ch) in text.chars().enumerate() {
-        if i > 0 {
-            for row in &mut rows {
-                row.push(Span::styled(" ", style));
-            }
-        }
-        let m = small_glyph(ch);
-        for (r, row) in rows.iter_mut().enumerate() {
-            let mut seg = String::new();
-            for c in 0..3 {
-                let mask = 4 >> c;
-                seg.push(half_char(m[r * 2] & mask != 0, m[r * 2 + 1] & mask != 0));
-            }
-            row.push(Span::styled(seg, style));
-        }
-    }
-    for (r, row) in rows.into_iter().enumerate() {
-        frame.render_widget(
-            Paragraph::new(Line::from(row)).alignment(Alignment::Center),
-            Rect::new(area.x, area.y + r as u16, area.width, 1),
-        );
-    }
-    true
-}
-
-fn draw_countdown(frame: &mut Frame, label: Rect, digits: Rect, next_name: &str, until_ms: i64) {
+fn draw_countdown(
+    frame: &mut Frame,
+    label: Rect,
+    digits: Rect,
+    next_name: &str,
+    until_ms: i64,
+    colon_on: bool,
+) {
     let text = Paragraph::new(Line::from(Span::styled(
         format!("Until {next_name}").to_uppercase(),
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -294,13 +314,12 @@ fn draw_countdown(frame: &mut Frame, label: Rect, digits: Rect, next_name: &str,
     .alignment(Alignment::Center);
     frame.render_widget(text, label);
     let style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
-    if digits.height >= 3 && render_small_digits(frame, digits, &format_hms(until_ms), style) {
-        return;
+    if !render_big_digits(frame, digits, &format_hms(until_ms), colon_on, style) {
+        frame.render_widget(
+            Paragraph::new(format_hms(until_ms)).style(style).alignment(Alignment::Center),
+            digits,
+        );
     }
-    frame.render_widget(
-        Paragraph::new(format_hms(until_ms)).style(style).alignment(Alignment::Center),
-        digits,
-    );
 }
 
 fn draw_prayer_cards(frame: &mut Frame, area: Rect, times: &PrayerTimes, next: &str) {
@@ -329,10 +348,12 @@ fn draw_prayer_cards(frame: &mut Frame, area: Rect, times: &PrayerTimes, next: &
             width: chunk.width.saturating_sub(2),
             height: chunk.height.saturating_sub(2),
         };
-        let row_y = inner.y + inner.height.saturating_sub(1) / 2;
-        let body = Paragraph::new(Span::styled(time, time_style))
-            .alignment(Alignment::Center);
-        frame.render_widget(body, Rect::new(inner.x, row_y, inner.width, 1));
+        if !render_big_digits(frame, inner, &time, true, time_style) {
+            let row_y = inner.y + inner.height.saturating_sub(1) / 2;
+            let body = Paragraph::new(Span::styled(time.clone(), time_style))
+                .alignment(Alignment::Center);
+            frame.render_widget(body, Rect::new(inner.x, row_y, inner.width, 1));
+        }
     }
 }
 
@@ -438,14 +459,15 @@ fn draw(frame: &mut ratatui::Frame, scheduler_on: bool) {
     ])
     .split(area);
 
+    let colon_on = local_now.timestamp() % 2 == 0;
     let data = Layout::vertical([
-        Constraint::Length(7), // big clock
+        Constraint::Min(7),    // giant clock, fills the remaining height
+        Constraint::Length(4), // seconds + AM/PM
         Constraint::Length(1), // hijri / date line
         Constraint::Length(1), // countdown label
-        Constraint::Length(3), // countdown block digits
-        Constraint::Min(1),    // spacer
+        Constraint::Length(7), // countdown block digits
+        Constraint::Length(1), // spacer
         Constraint::Length(4), // qiyam card
-        Constraint::Min(1),    // spacer
         Constraint::Length(1), // footer (left column only)
     ])
     .split(columns[0]);
@@ -456,12 +478,13 @@ fn draw(frame: &mut ratatui::Frame, scheduler_on: bool) {
     ])
     .split(columns[1]);
 
-    draw_clock(frame, data[0], local_now);
-    draw_date(frame, data[1], local_now);
-    draw_countdown(frame, data[2], data[3], &next_name, until_ms);
+    draw_clock(frame, data[0], local_now, colon_on);
+    draw_seconds(frame, data[1], local_now);
+    draw_date(frame, data[2], local_now);
+    draw_countdown(frame, data[3], data[4], &next_name, until_ms, colon_on);
 
     match calculate_night_thirds(lat, lng, date, &cfg.method, &cfg.madhab, now) {
-        Some(thirds) => draw_qiyam_card(frame, data[5], &thirds),
+        Some(thirds) => draw_qiyam_card(frame, data[6], &thirds),
         None => {
             let label = Paragraph::new(Span::styled(
                 "Qiyam — night thirds unavailable",
@@ -469,7 +492,7 @@ fn draw(frame: &mut ratatui::Frame, scheduler_on: bool) {
             ))
             .alignment(Alignment::Center)
             .block(Block::bordered().border_style(Style::default().fg(Color::DarkGray)));
-            frame.render_widget(label, data[5]);
+            frame.render_widget(label, data[6]);
         }
     }
 
@@ -491,4 +514,60 @@ fn draw(frame: &mut ratatui::Frame, scheduler_on: bool) {
         ),
         scheduler_on,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn big_digits_scale_to_fill_area() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                assert!(render_big_digits(f, area, "12:34", true, Style::default()));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let blocks = buf.content.iter().filter(|c| c.symbol() == "█").count();
+        assert!(blocks > 100, "expected large scaled glyphs, got {blocks} blocks");
+    }
+
+    #[test]
+    fn big_digits_fall_back_when_too_small() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        terminal
+            .draw(|f| {
+                // A 4x2 area cannot hold the 5x7 glyph grid.
+                assert!(!render_big_digits(
+                    f,
+                    Rect::new(0, 0, 4, 2),
+                    "12:34",
+                    true,
+                    Style::default()
+                ));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn big_digits_blink_colon_off() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                assert!(render_big_digits(f, area, "7:05", false, Style::default()));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // With the colon off its grid columns stay blank.
+        let blank_col = (4..8).all(|x| {
+            (0..7).all(|y| {
+                buf.content[(y as usize) * 40 + x as usize].symbol() == " "
+            })
+        });
+        assert!(blank_col, "colon column should be blank when blinked off");
+    }
 }
